@@ -1,0 +1,7 @@
+/build/
+/captures/
+/artifacts/
+*.pcap
+*.pcapng
+*.core
+core
