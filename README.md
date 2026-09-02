@@ -1,7 +1,7 @@
 # SMIUSB Open
 
-Open tooling and a crash guard for Silicon Motion SM768 USB displays
-(`090c:0768`), plus the clean-room foundation for a complete userspace driver.
+Open tooling, a patched EVDI kernel bridge, and a Rust clean-room driver for
+Silicon Motion SM768 USB displays (`090c:0768`).
 
 ## What already works
 
@@ -17,11 +17,20 @@ thread called `libusb_bulk_transfer` with a null handle while libusb's hotplug
 thread destroyed the same device. Detailed evidence and protocol observations
 are in [docs/reverse-engineering.md](docs/reverse-engineering.md).
 
-`smiusbd --observe` is the connection-lifecycle core of the independent
-replacement. Its hotplug callback only enqueues referenced devices; one owned
-worker opens and closes sessions, and every session has a generation number.
-It deliberately does not claim the display interface or transmit provisional
-protocol packets yet.
+The 2026-09-02 kernel panic is a separate dma-buf lifetime failure immediately
+after EVDI enabled the USB display. Exact kernel disassembly found a
+`vmapping_counter` remainder of one. The strongest actionable candidate is an
+unlocked EVDI persistent mapping, so the open patch serializes that path and
+prevents two concurrent callers from recording only one of two mappings. See
+[the incident analysis](docs/kernel-panic-2026-09-02.md).
+
+The independent replacement now lives under [`rust/`](rust/). It has a
+std-only libusb FFI layer with RAII ownership, passive hotplug observation,
+strict protocol decoders, deterministic packet builders, and an offline frame
+pipeline. USB transmission remains locked out until attach, mode-setting, and
+real frame captures are complete; the proprietary service still drives the
+monitor in the meantime. The staged design and remaining validation gates are
+in [the open-driver roadmap](docs/open-driver-roadmap.md).
 
 ## Build and test
 
@@ -29,7 +38,16 @@ protocol packets yet.
 meson setup build -Db_lundef=false
 meson compile -C build
 meson test -C build --print-errorlogs
+
+cd rust
+cargo test --offline
+cargo build --release --offline
+sudo install -m 0755 target/release/smiusbd-rs /usr/local/bin/smiusbd-open
 ```
+
+The installed `smiusbd-open` command is currently a passive development tool:
+it can observe reconnects and exercise the offline frame/JPEG pipeline, but it
+cannot claim the adapter or replace the active display service yet.
 
 `-Db_lundef=false` is required because the guard resolves the real libusb
 functions from the next object in the dynamic linker's search order.
@@ -55,6 +73,24 @@ Guard activity is visible with:
 journalctl -u smiusbdisplay.service -f
 ```
 
+## Install the EVDI panic fix
+
+The installer verifies and patches the exact SMI EVDI source already present
+on this host, builds it with DKMS, and checks the selected and initramfs copies
+against the build artifact. It does not stop the service or unload the
+currently active module, so the monitor stays on.
+
+```sh
+./scripts/install-patched-evdi.sh
+```
+
+The corrected module becomes active at the next normal reboot. Roll back the
+on-disk module without interrupting the current session with:
+
+```sh
+./scripts/rollback-patched-evdi.sh
+```
+
 ## Inspect and capture the device
 
 Print all configurations, interfaces, alternate settings, and endpoints:
@@ -63,6 +99,7 @@ Print all configurations, interfaces, alternate settings, and endpoints:
 ./build/smiusb-probe
 ./build/smiusb-probe --watch 120
 ./build/smiusbd --observe --duration 120
+./rust/target/release/smiusbd-rs --observe --duration 120
 ```
 
 Capture one KVM away/back cycle (default: USB bus 1 for 90 seconds):
@@ -82,7 +119,8 @@ automatically discards packets from other devices on the same USB bus.
 
 ## Project boundaries
 
-The repository is MIT-licensed and contains no Silicon Motion binary,
+The userspace repository is MIT-licensed; the EVDI-derived patch under
+`kernel/evdi` is GPL-2.0-only. The project contains no Silicon Motion binary,
 firmware, core dump, or copied decompiler output. The guard is a practical
 intermediate fix; the replacement display transport is still experimental and
 must be validated against usbmon captures before it is allowed to drive the

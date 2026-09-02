@@ -1,0 +1,187 @@
+--- a/evdi_drm_drv.h
++++ b/evdi_drm_drv.h
+@@ -64,6 +64,8 @@
+ 	struct page **pages;
+ 	unsigned int pages_pin_count;
+ 	struct mutex pages_lock;
++	/* Serializes the persistent kernel mapping stored in vmapping. */
++	struct mutex vmap_lock;
+ 	void *vmapping;
+ #if KERNEL_VERSION(5, 11, 0) <= LINUX_VERSION_CODE || defined(EL8)
+ 	bool vmap_is_iomem;
+--- a/evdi_cursor.c
++++ b/evdi_cursor.c
+@@ -124,7 +124,7 @@ void evdi_cursor_set(struct evdi_cursor *cursor,
+ 	int err = 0;
+ 
+ 	evdi_cursor_lock(cursor);
+-	if (obj && !obj->vmapping)
++	if (obj)
+ 		err = evdi_gem_vmap(obj);
+ 
+ 	if (err != 0) {
+--- a/evdi_gem.c
++++ b/evdi_gem.c
+@@ -117,6 +117,7 @@
+ 	obj->allow_sw_cursor_rect_updates = false;
+ 
+ 	mutex_init(&obj->pages_lock);
++	mutex_init(&obj->vmap_lock);
+ 
+ 	return obj;
+ }
+@@ -369,7 +370,18 @@
+ int evdi_gem_vmap(struct evdi_gem_object *obj)
+ {
+ 	int page_count = DIV_ROUND_UP(obj->base.size, PAGE_SIZE);
+-	int ret;
++	int ret = 0;
++
++	mutex_lock(&obj->vmap_lock);
++
++	/*
++	 * The mapping is intentionally persistent for the lifetime of the GEM
++	 * object. Concurrent callers must share one EVDI-owned dma-buf vmap
++	 * reference. Otherwise each call increments vmapping_counter while object
++	 * teardown performs only one vunmap.
++	 */
++	if (obj->vmapping)
++		goto out_unlock;
+ 
+ 	if (evdi_drm_gem_object_use_import_attach(&obj->base)) {
+ #if KERNEL_VERSION(5, 18, 0) <= LINUX_VERSION_CODE || defined(EL8) || defined(EL9)
+@@ -385,29 +397,40 @@
+ 		ret = dma_buf_vmap(obj->base.import_attach->dmabuf, &map);
+ # endif
+ 		if (ret)
+-			return -ENOMEM;
+-		obj->vmapping = map.vaddr;
+-		obj->vmap_is_iomem = map.is_iomem;
++			ret = -ENOMEM;
++		else {
++			obj->vmapping = map.vaddr;
++			obj->vmap_is_iomem = map.is_iomem;
++		}
+ #else
+ 		obj->vmapping = dma_buf_vmap(obj->base.import_attach->dmabuf);
+ 		if (!obj->vmapping)
+-			return -ENOMEM;
++			ret = -ENOMEM;
+ #endif
+-		return 0;
++		goto out_unlock;
+ 	}
+ 
+ 	ret = evdi_pin_pages(obj);
+ 	if (ret)
+-		return ret;
++		goto out_unlock;
+ 
+ 	obj->vmapping = vmap(obj->pages, page_count, 0, PAGE_KERNEL);
+-	if (!obj->vmapping)
+-		return -ENOMEM;
+-	return 0;
++	if (!obj->vmapping) {
++		evdi_unpin_pages(obj);
++		ret = -ENOMEM;
++	}
++
++out_unlock:
++	mutex_unlock(&obj->vmap_lock);
++	return ret;
+ }
+ 
+ void evdi_gem_vunmap(struct evdi_gem_object *obj)
+ {
++	mutex_lock(&obj->vmap_lock);
++	if (!obj->vmapping)
++		goto out_unlock;
++
+ 	if (evdi_drm_gem_object_use_import_attach(&obj->base)) {
+ #if KERNEL_VERSION(5, 18, 0) <= LINUX_VERSION_CODE || defined(EL8) || defined(EL9)
+ 		struct iosys_map map = IOSYS_MAP_INIT_VADDR(NULL);
+@@ -436,7 +459,7 @@
+ 		dma_buf_vunmap(obj->base.import_attach->dmabuf, obj->vmapping);
+ #endif
+ 		obj->vmapping = NULL;
+-		return;
++		goto out_unlock;
+ 	}
+ 
+ 	if (obj->vmapping) {
+@@ -445,14 +468,16 @@
+ 	}
+ 
+ 	evdi_unpin_pages(obj);
++
++out_unlock:
++	mutex_unlock(&obj->vmap_lock);
+ }
+ 
+ void evdi_gem_free_object(struct drm_gem_object *gem_obj)
+ {
+ 	struct evdi_gem_object *obj = to_evdi_bo(gem_obj);
+ 
+-	if (obj->vmapping)
+-		evdi_gem_vunmap(obj);
++	evdi_gem_vunmap(obj);
+ 
+ 	if (gem_obj->import_attach)
+ 		drm_prime_gem_destroy(gem_obj, obj->sg);
+@@ -462,6 +487,7 @@
+ 
+ 	if (gem_obj->dev->vma_offset_manager)
+ 		drm_gem_free_mmap_offset(gem_obj);
++	mutex_destroy(&obj->vmap_lock);
+ 	mutex_destroy(&obj->pages_lock);
+ 	drm_gem_object_release(&obj->base);
+ 	kfree(obj);
+--- a/evdi_painter.c
++++ b/evdi_painter.c
+@@ -1126,17 +1126,10 @@ int evdi_painter_grabpix_ioctl(struct drm_device *drm_dev, void *data,
+ 
+ 	painter_unlock(painter);
+ 
+-	if (!efb->obj->vmapping) {
+-		if (evdi_gem_vmap(efb->obj) == -ENOMEM) {
+-			EVDI_ERROR("Failed to map scanout buffer\n");
+-			err = -EFAULT;
+-			goto err_fb;
+-		}
+-		if (!efb->obj->vmapping) {
+-			EVDI_ERROR("Inexistent vmapping\n");
+-			err = -EFAULT;
+-			goto err_fb;
+-		}
++	if (evdi_gem_vmap(efb->obj)) {
++		EVDI_ERROR("Failed to map scanout buffer\n");
++		err = -EFAULT;
++		goto err_fb;
+ 	}
+ 
+ 	if ((unsigned int)cmd->buf_width != efb->base.width ||
+--- a/evdi_platform_drv.c
++++ b/evdi_platform_drv.c
+@@ -25,6 +25,7 @@
+ MODULE_AUTHOR("DisplayLink (UK) Ltd.");
+ MODULE_DESCRIPTION("Extensible Virtual Display Interface");
+ MODULE_LICENSE("GPL");
++MODULE_VERSION("1.14.16-smiusb2");
+ 
+ #define EVDI_DEVICE_COUNT_MAX 16
+ 
+--- a/dkms.conf
++++ b/dkms.conf
+@@ -7,11 +7,11 @@
+ #
+ 
+ PACKAGE_NAME="evdi"
+-PACKAGE_VERSION=1.14.16
++PACKAGE_VERSION=1.14.16.smiusb2
+ AUTOINSTALL=yes
+ 
+-MAKE[0]="make all INCLUDEDIR=/lib/modules/$kernelver/build/include KVERSION=$kernelver DKMS_BUILD=1"
++MAKE[0]="make all INCLUDEDIR=/lib/modules/$kernelver/build/include KERNELRELEASE=$kernelver DKMS_BUILD=1"
+ DEST_MODULE_LOCATION[0]="/kernel/drivers/gpu/drm/evdi"
+ BUILT_MODULE_NAME[0]="evdi"
+ CLEAN="make clean KERNELRELEASE=$kernelver DKMS_BUILD=1"

@@ -1,0 +1,8 @@
+SPDX-License-Identifier: GPL-2.0-only
+
+The EVDI-derived patch in this directory is licensed under the GNU General
+Public License version 2 only, matching the source to which it applies.
+
+The complete license text is available in the Linux source tree as `COPYING`,
+in Debian/Ubuntu systems as `/usr/share/common-licenses/GPL-2`, and at:
+https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt

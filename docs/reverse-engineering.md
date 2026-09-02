@@ -40,10 +40,16 @@ These fields are provisional until checked against usbmon captures.
 - The wire prefix is the 12-byte ASCII marker `smifalconsta`.
 - The initial capabilities request is 48 bytes and is followed by a response
   associated with command/data type `0x65`.
-- A frame packet starts with a 48-byte transport header, followed by a
-  `0x5000`-byte JPEG decoder header and then the compressed payload.
-- The total frame transfer is padded so its transfer length is not an exact
-  multiple of 512 bytes.
+- A frame packet starts with a 48-byte transport header, followed by the
+  compressed JPEG bytes and then an area of `0x5000` bytes reserved for CnM
+  decoder metadata. The old assumption that decoder metadata preceded the
+  JPEG was incorrect.
+- The constructed transfer length is `jpeg_length + 0x5030`. The vendor adds
+  one byte when that length is an exact multiple of 512. This comes from the
+  binary's packet builder and still needs a real frame capture for wire-level
+  validation.
+- The JPEG input format is BGRX with 4:2:2 chroma subsampling, matching
+  TurboJPEG's `TJPF_BGRX` and `TJSAMP_422` values.
 - Frames are JPEG-based. Dirty rectangles, frame indices, target/source IDs,
   cursor commands, EDID, power state, and heartbeat are separate protocol
   operations.
@@ -55,11 +61,16 @@ Filtering it to `090c:0768` confirmed the complete USB layout:
 
 - Configuration 1 exposes five interfaces. Display transport is interface 4,
   alternate setting 1.
-- The transport endpoints are interrupt IN `0x81` (1024-byte max packet),
-  interrupt OUT `0x01` (1024-byte max packet), and bulk OUT `0x02` (512-byte
-  max packet).
+- The transport endpoints are interrupt IN `0x81`, interrupt OUT `0x01`, and
+  bulk OUT `0x02`. Max-packet size depends on negotiated USB speed: the older
+  High Speed capture reports 512 bytes for bulk OUT, while the currently
+  attached SuperSpeed device reports 1024. The replacement must read endpoint
+  descriptors instead of hardcoding either value.
 - With a static desktop, endpoint `0x02` sent one 44-byte `smifalconsta` packet
-  per second. Its little-endian word at offset 12 is also 44.
+  per second. Its little-endian word at offset 12 is also 44. A passive uprobe
+  later showed an ASCII decimal worker-thread tag beginning at offset 35 and a
+  NUL terminator, followed by three bytes the vendor leaves uninitialized. The
+  Rust replacement zeroes the unused bytes rather than leaking stack data.
 - Endpoint `0x81` completed a 1024-byte read roughly twice per second. Its
   payload starts with the same marker and contains the active 1600x900 mode
   followed by a table of supported resolutions and refresh rates.
