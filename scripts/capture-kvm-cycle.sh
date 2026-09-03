@@ -3,11 +3,20 @@ set -eu
 
 project_dir=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 duration=${1:-90}
-bus=${2:-1}
+case ${2:-} in
+    session|usb)
+        trigger=$2
+        bus=${3:-}
+        ;;
+    *)
+        bus=${2:-}
+        trigger=${3:-session}
+        ;;
+esac
 timestamp=$(date +%Y%m%d-%H%M%S)
 capture_dir="$project_dir/captures"
-capture_file="$capture_dir/smiusb-kvm-$timestamp.pcapng"
-summary_file="$capture_dir/smiusb-kvm-$timestamp.txt"
+capture_file="$capture_dir/smiusb-cycle-$timestamp.pcapng"
+summary_file="$capture_dir/smiusb-cycle-$timestamp.txt"
 capture_tmp=''
 filtered_tmp=''
 restore_apparmor=0
@@ -36,6 +45,31 @@ if [ "$duration" -eq 0 ]; then
     printf '%s\n' 'duration must be a positive number of seconds' >&2
     exit 2
 fi
+
+case "$trigger" in
+    session)
+        trigger_instruction='Lock and unlock the session now; leave the USB adapter connected.'
+        ;;
+    usb)
+        trigger_instruction='Physically disconnect and reconnect the USB adapter now.'
+        ;;
+    *)
+        printf '%s\n' 'trigger must be session or usb' >&2
+        exit 2
+        ;;
+esac
+
+if [ -z "$bus" ]; then
+    detected_buses=$(lsusb -d 090c:0768 2>/dev/null | awk '{ print $2 + 0 }' | sort -nu)
+    detected_bus_count=$(printf '%s\n' "$detected_buses" | awk 'NF { count++ } END { print count + 0 }')
+    if [ "$detected_bus_count" -ne 1 ]; then
+        printf '%s\n' \
+            'could not auto-detect exactly one SMIUSB bus; pass the bus number as argument 2' >&2
+        exit 2
+    fi
+    bus=$(printf '%s\n' "$detected_buses" | awk 'NF { print; exit }')
+fi
+
 case "$bus" in
     *[!0-9]*|'')
         printf '%s\n' 'bus must be a positive USB bus number' >&2
@@ -49,7 +83,7 @@ fi
 
 mkdir -p "$capture_dir"
 sudo modprobe usbmon
-capture_tmp=$(sudo mktemp /tmp/smiusb-kvm.XXXXXX.pcapng)
+capture_tmp=$(sudo mktemp /tmp/smiusb-cycle.XXXXXX.pcapng)
 initial_addresses=$(lsusb -d 090c:0768 2>/dev/null | awk -v wanted="$(printf '%03d' "$bus")" '
     $2 == wanted { gsub(":", "", $4); print $4 }
 ')
@@ -63,8 +97,8 @@ if command -v aa-status >/dev/null 2>&1 && \
     restore_apparmor=1
 fi
 
-printf 'Capturing usbmon%s for %s seconds. Switch the KVM away and back now.\n' \
-    "$bus" "$duration"
+printf 'Capturing usbmon%s for %s seconds. %s\n' \
+    "$bus" "$duration" "$trigger_instruction"
 sudo tshark -q -i "usbmon$bus" -a "duration:$duration" -w "$capture_tmp"
 
 observed_addresses=$(sudo tshark -r "$capture_tmp" \

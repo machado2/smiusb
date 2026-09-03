@@ -9,6 +9,8 @@ use jpeg::Compressor;
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::c_int;
+use std::fs::File;
+use std::io::{self, Read};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -42,6 +44,7 @@ enum Command {
         duration: Option<Duration>,
     },
     DecodeHex(Vec<u8>),
+    DecodeHexFile(String),
     ProtocolInfo,
     Pattern {
         options: PatternOptions,
@@ -65,6 +68,7 @@ const DEFAULT_JPEG_QUALITY: u8 = 80;
 const MAX_PATTERN_FRAMES: u64 = 1_000;
 const MAX_QUEUE_CAPACITY: usize = 256;
 const MAX_PATTERN_WORK_BYTES: usize = 512 * 1024 * 1024;
+const MAX_HEX_TEXT_BYTES: usize = 32 * 1024 * 1024;
 
 fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
     let mut nibbles = Vec::new();
@@ -85,6 +89,45 @@ fn parse_hex(input: &str) -> Result<Vec<u8>, String> {
         .chunks_exact(2)
         .map(|pair| (pair[0] << 4) | pair[1])
         .collect())
+}
+
+fn read_hex_text<R: Read>(reader: R, limit: usize) -> Result<Vec<u8>, String> {
+    let read_limit = limit
+        .checked_add(1)
+        .ok_or_else(|| "hex text byte limit overflows this platform".to_owned())?;
+    let read_limit = u64::try_from(read_limit)
+        .map_err(|_| "hex text byte limit does not fit the reader API".to_owned())?;
+    let mut text_bytes = Vec::new();
+    reader
+        .take(read_limit)
+        .read_to_end(&mut text_bytes)
+        .map_err(|error| format!("cannot read hex text: {error}"))?;
+    if text_bytes.len() > limit {
+        return Err(format!(
+            "hex text exceeds the {limit} byte safety limit (including whitespace)"
+        ));
+    }
+    let text = std::str::from_utf8(&text_bytes)
+        .map_err(|error| format!("hex input is not valid UTF-8 text: {error}"))?;
+    parse_hex(text)
+}
+
+fn read_hex_file(path: &str) -> Result<Vec<u8>, String> {
+    if path == "-" {
+        return read_hex_text(io::stdin().lock(), MAX_HEX_TEXT_BYTES);
+    }
+
+    let file = File::open(path).map_err(|error| format!("cannot open {path:?}: {error}"))?;
+    let length = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {path:?}: {error}"))?
+        .len();
+    if length > MAX_HEX_TEXT_BYTES as u64 {
+        return Err(format!(
+            "hex text in {path:?} is {length} bytes; safety limit is {MAX_HEX_TEXT_BYTES} bytes including whitespace"
+        ));
+    }
+    read_hex_text(file, MAX_HEX_TEXT_BYTES).map_err(|error| format!("{path:?}: {error}"))
 }
 
 fn parse_args(arguments: &[String]) -> Result<Command, String> {
@@ -111,10 +154,13 @@ fn parse_args(arguments: &[String]) -> Result<Command, String> {
             })
         }
         [mode, input] if mode == "--decode-hex" => Ok(Command::DecodeHex(parse_hex(input)?)),
+        [mode, path] if mode == "--decode-hex-file" => {
+            Ok(Command::DecodeHexFile(path.to_owned()))
+        }
         [mode] if mode == "--protocol-info" => Ok(Command::ProtocolInfo),
         [mode] if mode == "--screen-cast-version" => Ok(Command::ScreenCastVersion),
         _ => Err(
-            "usage: smiusbd-rs --observe [--duration SECONDS]\n       smiusbd-rs --decode-hex HEX\n       smiusbd-rs --protocol-info\n       smiusbd-rs --pattern WIDTHxHEIGHT [--frames COUNT] [--queue CAPACITY]\n       smiusbd-rs --encode-plan WIDTHxHEIGHT [--frames COUNT] [--queue CAPACITY] [--quality 1..100]\n       smiusbd-rs --screen-cast-version"
+            "usage: smiusbd-rs --observe [--duration SECONDS]\n       smiusbd-rs --decode-hex HEX\n       smiusbd-rs --decode-hex-file PATH|-\n       smiusbd-rs --protocol-info\n       smiusbd-rs --pattern WIDTHxHEIGHT [--frames COUNT] [--queue CAPACITY]\n       smiusbd-rs --encode-plan WIDTHxHEIGHT [--frames COUNT] [--queue CAPACITY] [--quality 1..100]\n       smiusbd-rs --screen-cast-version"
                 .to_owned(),
         ),
     }
@@ -245,6 +291,39 @@ fn observe(duration: Option<Duration>) -> Result<(), String> {
 
 fn decode(packet: &[u8]) -> Result<(), String> {
     let header = protocol::parse_header(packet).map_err(|error| error.to_string())?;
+    if header.word16 == protocol::FRAME_SIGNATURE {
+        let payload_length = packet.len().saturating_sub(protocol::HEADER_SIZE);
+        let max_packet_size =
+            if payload_length.is_multiple_of(protocol::SUPER_SPEED_MAX_PACKET_SIZE) {
+                protocol::SUPER_SPEED_MAX_PACKET_SIZE
+            } else {
+                protocol::HIGH_SPEED_MAX_PACKET_SIZE
+            };
+        let frame = protocol::parse_frame_envelope(packet, max_packet_size)
+            .map_err(|error| error.to_string())?;
+        println!(
+            "sequence={} byte23={:#04x} jpeg={} decoder={} padding={}",
+            frame.sequence,
+            frame.unclassified_byte23,
+            frame.jpeg.len(),
+            frame.decoder_metadata.len(),
+            frame.padding.len()
+        );
+        return Ok(());
+    }
+
+    if packet.len() == protocol::FRAME_ACK_SIZE && header.word16 == protocol::FRAME_ACK_SIGNATURE {
+        let ack = protocol::parse_frame_ack(packet).map_err(|error| error.to_string())?;
+        println!(
+            "frame-ack sequence={} bytes21-23={:02x}{:02x}{:02x}",
+            ack.sequence,
+            ack.unclassified_bytes21_23[0],
+            ack.unclassified_bytes21_23[1],
+            ack.unclassified_bytes21_23[2]
+        );
+        return Ok(());
+    }
+
     println!(
         "bytes={} word12={:#010x} word16={:#010x} byte20={:#04x}",
         packet.len(),
@@ -252,13 +331,20 @@ fn decode(packet: &[u8]) -> Result<(), String> {
         header.word16,
         header.byte20
     );
-    if let Ok(request) = protocol::parse_command_request(packet) {
+    if let Ok(request) = protocol::parse_canonical_command_request(packet) {
         println!(
             "request class={:#x} opcode={:#04x} length={}",
             protocol::COMMAND_CLASS,
             request.opcode,
             request.length
         );
+        return Ok(());
+    }
+    // Words 12 and 16 are not universal length/class fields. For example,
+    // captures contain opcode 0x45 with word12=8 in a 44-byte transfer and
+    // opcode 0x32 with word16=0x10000006. A short, otherwise valid packet is
+    // useful metadata rather than an error.
+    if packet.len() < protocol::HEADER_SIZE {
         return Ok(());
     }
     let modes = protocol::parse_observed_modes(packet).map_err(|error| error.to_string())?;
@@ -426,6 +512,7 @@ fn main() -> ExitCode {
     let result = match parse_args(&arguments) {
         Ok(Command::Observe { duration }) => observe(duration),
         Ok(Command::DecodeHex(packet)) => decode(&packet),
+        Ok(Command::DecodeHexFile(path)) => read_hex_file(&path).and_then(|packet| decode(&packet)),
         Ok(Command::ProtocolInfo) => {
             print_protocol_info();
             Ok(())
@@ -475,6 +562,42 @@ mod tests {
     #[test]
     fn hex_parser_rejects_non_ascii_without_panicking() {
         assert!(parse_hex("aéx").is_err());
+    }
+
+    #[test]
+    fn parses_decode_hex_file_path_and_stdin() {
+        assert_eq!(
+            parse_args(&["--decode-hex-file".into(), "capture.hex".into()]).unwrap(),
+            Command::DecodeHexFile("capture.hex".into())
+        );
+        assert_eq!(
+            parse_args(&["--decode-hex-file".into(), "-".into()]).unwrap(),
+            Command::DecodeHexFile("-".into())
+        );
+    }
+
+    #[test]
+    fn bounded_hex_reader_counts_whitespace_and_rejects_before_parsing() {
+        assert_eq!(
+            read_hex_text(io::Cursor::new(b"00 \n"), 4).unwrap(),
+            vec![0]
+        );
+
+        let error = read_hex_text(io::Cursor::new(b"xxxxx"), 4).unwrap_err();
+        assert!(error.contains("exceeds the 4 byte safety limit"));
+        assert!(!error.contains("invalid hex digit"));
+    }
+
+    #[test]
+    fn generic_decoder_accepts_observed_opcode_specific_header_words() {
+        for (opcode, word12, word16) in [(0x45, 8_u32, 6_u32), (0x32, 44, 0x1000_0006)] {
+            let mut packet = vec![0_u8; 44];
+            packet[..protocol::WIRE_MAGIC.len()].copy_from_slice(protocol::WIRE_MAGIC);
+            packet[12..16].copy_from_slice(&word12.to_le_bytes());
+            packet[16..20].copy_from_slice(&word16.to_le_bytes());
+            packet[20] = opcode;
+            assert!(decode(&packet).is_ok());
+        }
     }
 
     #[test]

@@ -41,6 +41,34 @@ tests `dma_buf.vmapping_counter`. Register `RCX` held `1`, proving one
 outstanding vmap reference at release. That is consistent with a missing
 vunmap, but premature final release or counter corruption are also possible.
 
+## Trigger correlation
+
+The panic was not caused by a physical USB detach/reconnect. The final ten
+minutes preserved by the capture kernel contain no USB disconnect, new-device,
+reset, or EVDI disconnect/connect event. The persistent journal shows that the
+SM768 had last disconnected and re-enumerated more than eight hours earlier,
+at 11:13:14--11:13:15, and remained present through the panic. There was also
+no system suspend/resume transition near the failure.
+
+The evidence instead supports a graphical-session wake path. At 15:52:26,
+GNOME Shell logged an AccountsService password-mode lookup that the installed
+GNOME Shell 50.1 performs in its screen-shield lock method. This suggests lock
+path activity rather than recording a lock signal directly. The lid closed one
+second later; EVDI then went off, briefly back on with a mode, and finally off
+again at 15:52:58. No later EVDI transition is preserved before the 19:46:12
+power-on and mode notification immediately preceding the BUG. The failing
+GNOME Shell system call was `DRM_IOCTL_GEM_CLOSE`, so a compositor GEM handle
+was being released as EVDI reactivated its CRTC. Together with the user's
+recollection of locking and unlocking the machine, session unlock/DPMS wake is
+the most likely trigger. GNOME emitted no explicit unlock record before the
+panic, so the exact user action remains strongly supported rather than proven
+solely by the logs.
+
+Later manual USB detach/reconnect cycles were deliberate tests, not the panic
+trigger. The first post-patch cycle at 21:38:16 completed without a new BUG,
+Oops, panic, or userspace coredump; it validates only the physical-detach guard
+path and does not yet validate lock/unlock.
+
 Passive tracing on the next boot demonstrated the candidate ownership chain:
 an SMI userspace update thread entered an EVDI path that vmap'ed i915 buffers,
 and an EVDI free path ran in GNOME Shell context. Three ordinary samples were
